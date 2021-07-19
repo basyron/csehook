@@ -2,13 +2,17 @@ import json
 import random
 import re
 import string
+from contextlib import suppress
+from http import HTTPStatus
 from itertools import chain
-from typing import Any, NewType, Iterator
+from time import sleep
+from typing import Any, NewType, Iterator, Union
 from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
 from csehook.utils.wired_driver import WiredDriver
+from config import USER_AGENTS
 
 
 _alphabet = string.ascii_letters
@@ -18,6 +22,10 @@ _GoogleCSEIterator = NewType("_GoogleCSEIterator", Iterator[_GoogleCSEResults])
 
 
 class CseHook:
+
+    _MAX_PROXY_RETRIES = 50
+    _STANDARD_SLEEP = 10
+    _TIMEOUT = 8
 
     def __init__(self,
                  cse_uri: str,
@@ -52,6 +60,8 @@ class CseHook:
             for label, start in zip(range(1, 11), range(0, 91, 10))
         }
 
+        self._proxy_list = self._config_proxy_list()
+
     def _get_modified_uri(self, uri: str, query: str, page: int = 1) -> str:
         """Parse URL, modify it and return its requestable resource."""
         parsed_uri = urlparse(uri)
@@ -69,6 +79,15 @@ class CseHook:
         )
 
         return f"{base_uri}?{query_string}"
+
+    @staticmethod
+    def _config_proxy_list() -> list:
+        response = requests.get(
+            "https://proxylist.geonode.com/api/proxy-list?"
+            "limit=100&page=1&sort_by=lastChecked&sort_type=desc"
+            "&speed=fast"
+        )
+        return response.json().get("data")
 
     def _get_random_words(self) -> Iterator[str]:
         """Yield random words based on word_size and amount_of_words."""
@@ -98,13 +117,77 @@ class CseHook:
 
             del self._wired_driver.instance.requests
 
+    def _get_response(self,
+                      uri: str,
+                      headers: dict,
+                      proxies: dict,
+                      retries: int = 0) -> Union[requests.Response, bool]:
+        """Attempt to request with specified params.
+
+        Returns:
+            bool -- when a request raised an exception.
+            requests.Response -- when endpoint was requested successfully.
+        """
+        with suppress(Exception):
+            response = requests.get(
+                uri, headers=headers, proxies=proxies, timeout=self._TIMEOUT
+            )
+            return response
+
+        if retries >= self._MAX_PROXY_RETRIES:
+            self._proxy_list = self._config_proxy_list()
+
+        return False
+
     def _search_page(self,
                      uri: str,
                      query: str,
-                     page: int = 1) -> _GoogleCSEJson:
+                     page: int = 1) -> Union[_GoogleCSEJson, dict]:
         """Request a CSE API and return its json."""
-        response = requests.get(self._get_modified_uri(uri, query, page))
+
+        schemas = ("http", "https")
+        error_count = 0
+        response = False
+
+        # Retries different proxies until we have a response.
+        while not response:
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+
+            if not self._proxy_list:
+                self._proxy_list = self._config_proxy_list()
+
+            chosen_proxy = random.choice(self._proxy_list)
+
+            protocol = chosen_proxy.get('protocols')[0]
+            ip = chosen_proxy.get("ip")
+            port = chosen_proxy.get("port")
+
+            proxies = {k: f"{protocol}://{ip}:{port}" for k in schemas}
+
+            response = self._get_response(
+                self._get_modified_uri(uri, query, page),
+                headers=headers,
+                proxies=proxies,
+                retries=error_count
+            )
+            # Remove bad proxy from list.
+            if not response:
+                self._proxy_list.pop(self._proxy_list.index(chosen_proxy))
+
+            error_count += 1
+
+            # Avoid too many requests to Geonode.
+            # Sometimes proxies are just bad in that moment.
+            if error_count > self._MAX_PROXY_RETRIES:
+                error_count = 0
+
+        status_code = response.status_code
+
+        if status_code == HTTPStatus.FORBIDDEN:
+            return {"error": "temp_ban"}
+
         api_json = json.loads(self._cse_regex.findall(response.text)[0][1])
+
         return api_json
 
     def search(self,
@@ -123,17 +206,34 @@ class CseHook:
         first_page = self._search_page(
             random.choice(self._cse_api_uris), query
         )
+
+        error = first_page.get("error")
+        while error:
+            # If we were temporarily banned, return False.
+            if isinstance(error, str):
+                return False
+
+            # If old CSE API URIs start to fail, refresh them.
+            sleep(self._STANDARD_SLEEP)
+            self._config_new_cse_api_uris()
+            first_page = self._search_page(
+                random.choice(self._cse_api_uris), query
+            )
+
         first_result = iter((first_page.get("results", []),))
 
-        if len(first_page.get("cursor", {}).get("pages")) == 1:
+        if len(first_page.get("cursor", {}).get("pages", [])) <= 1:
             return first_result
 
         # If more then one page available, yield them all on-demand.
         yield from chain(
             first_result, (
-                self._search_page(
-                    random.choice(self._cse_api_uris), query, p
-                ).get("results", [])
+                results
                 for p in tuple(self._pages.keys())[1:]
+                if (
+                    results := self._search_page(
+                        random.choice(self._cse_api_uris), query, p
+                    ).get("results", [])
+                )
             )
         )
