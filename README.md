@@ -1,2 +1,2 @@
 # csehook
-A proof of concept that hooks Google CSE API URIs to performs automated active searches in Google's search engine.
+A proof of concept that intercepts Google CSE API URIs to perform automated active searches in Google's search engine.
