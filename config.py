@@ -4,7 +4,7 @@ from pathlib import Path
 import requests
 
 
-CSE_URI = "https://cse.google.com/cse?cx=8d57d6f6129439b92"
+CSE_URI = "{YOUR_CSE_URI_HERE}"  # example: https://cse.google.com/cse?cx=...
 DEFAULT_DRIVER = os_join(
     Path(__file__).parent.resolve(), "driver/mac/chrome/chromedriver"
 )
